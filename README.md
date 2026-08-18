@@ -9,6 +9,33 @@ navigation strategies (linear, tree, and graph search) in real time.
 
 Prerequisite: a Go installation (1.26+).
 
+## POMDP variables
+
+Formally, a POMDP is the tuple **(S, A, T, Ω, O, R, γ, b₀)**. This SDK gives
+each of those a concrete Go type or component, plus one addition
+(**G**, the goal) that the classical model leaves implicit. The gridworld
+demo column shows what each variable actually *is* in the shipped example.
+
+| Symbol | Name | Description | SDK representation | Gridworld demo |
+|---|---|---|---|---|
+| **S** | State space | The true, possibly hidden set of states the environment can occupy. The agent never reads this directly. | `component.State{Seq, Time, Data}` — a versioned, timestamped snapshot held by the **State Ledger** | The agent's real `(X, Y)` cell, held in `Environment.true_` and mutated only by `Actuator.Execute` |
+| **A** | Action space | The set of actions available to the agent at any point | `component.Action{Name, Params}`, enumerated by the **Action Registry** (`List()`/`Get()`) | `{up, down, left, right, stay}`, registered as `gridworld.Moves` |
+| **T(s' \| s, a)** | Transition function | The (here, deterministic) probability of landing in state s′ after taking action a from state s | `TransitionEngine.Apply(ctx, current, action) → next` | Clamps the move to the grid and rejects it if the destination is a wall |
+| **Ω** | Observation space | The set of signals the agent can perceive about the world | `component.Observation{Seq, Time, Data}`, appended to the **Observation Ledger** | A noisy `(X, Y)` reading, perturbed by up to `±Env.Noise` on each axis |
+| **O(o \| s', a)** | Observation function | The probability of perceiving observation o given the resulting state s′ and action a | `ObservationGateway.Observe(ctx) → Observation` | `Environment.NoisyPosition()` — uniform noise in `[-Noise, +Noise]`, clamped to the grid |
+| **b** | Belief state | The agent's running probability estimate over S, derived from the full observation history (what the agent *thinks* is true) | `component.Belief{Time, Data}`, produced by `BeliefEngine.Update(ctx, prior, obs)` | Exponential smoothing of noisy readings: `next = α·obs + (1-α)·prior`, rounded to the nearest cell |
+| **R(s, a, s')** | Reward function | The feedback signal produced by a transition, used to judge action quality | `component.Reward{Time, Value, Info}`, produced by `RewardEvaluator.Evaluate(ctx, prev, action, next)` | `-1` per step, `+100` on reaching the goal; `Info` carries the remaining Manhattan distance |
+| **γ** | Discount factor | How much future reward is worth relative to immediate reward, in the classical infinite-horizon formulation | *Not modeled.* This SDK targets episodic, goal-directed runs (reach the goal or exhaust the budget) rather than infinite-horizon return maximization — `Config.MaxSteps` caps the horizon instead of a discount | `MaxSteps: 500` in the demo server |
+| **π** | Policy | The function mapping belief (and goal) to an action | `PolicyEngine.Decide(ctx, goal, belief) → Action` | Greedy: move one cell along whichever axis is furthest from the goal, based on belief |
+| **G** *(SDK addition)* | Goal | What the Orchestrator is trying to achieve — not part of the classical tuple, but required to know when a POMDP *episode* ends | `component.Goal{ID, Data}` + `Config.IsGoalReached(State) bool` | `Goal.Data` is the target `(X, Y)`; reached when the *true* position equals it |
+
+Two more fields exist purely as SDK bookkeeping, not classical POMDP
+variables: the **Observation Ledger** (`ObservationLedger`) is the
+durable, append-only log everything else can be rebuilt from, and the
+**State Ledger** (`StateLedger`) is a fast, rebuildable materialized
+projection of "current state" over that log — S itself is still owned by
+the environment, not by either ledger.
+
 ![Gridworld dashboard](docs/screenshots/dashboard-ui.png)
 
 ## What is a POMDP, and what does this project simulate?
