@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Architecture — Gridworld Demo</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --border: #2a2f3a; --text: #e6e8ec;
+    --muted: #8891a0; --accent: #4da3ff; --good: #3ecf8e; --bad: #ff6b6b; --warn: #ffb84d;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.4 -apple-system, Segoe UI, Roboto, sans-serif; }
+  header { padding: 14px 20px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  main { display: grid; grid-template-columns: 1fr 360px; gap: 16px; padding: 20px; align-items: start; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px; }
+  label { color: var(--muted); font-size: 12px; margin-right: 4px; }
+  input[type=number] { width: 64px; background: #0f1115; border: 1px solid var(--border); color: var(--text); border-radius: 4px; padding: 4px 6px; }
+  select { background: #0f1115; border: 1px solid var(--border); color: var(--text); border-radius: 4px; padding: 4px 6px; }
+  button { background: var(--accent); border: none; color: #06111f; font-weight: 600; padding: 7px 14px; border-radius: 6px; cursor: pointer; }
+  button:hover { filter: brightness(1.1); }
+  #status { font-size: 13px; color: var(--muted); margin-left: auto; }
+  #status.good { color: var(--good); }
+  #status.bad { color: var(--bad); }
+  canvas#grid { background: #0b0d12; border: 1px solid var(--border); border-radius: 6px; display: block; }
+  .legend { display: flex; gap: 14px; margin-top: 10px; font-size: 12px; color: var(--muted); }
+  .legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+  #log { height: 260px; overflow-y: auto; font-family: ui-monospace, Consolas, monospace; font-size: 11.5px; border-top: 1px solid var(--border); margin-top: 12px; padding-top: 8px; }
+  #log div { padding: 2px 0; border-bottom: 1px solid #1d212a; color: var(--muted); }
+  #log div b { color: var(--text); }
+  canvas#reward { width: 100%; height: 90px; background: #0b0d12; border: 1px solid var(--border); border-radius: 6px; }
+  h3 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Architecture — Gridworld Demo</h1>
+  <span class="sub">Orchestrator · Event Bus · 9 components, live over SSE</span>
+  <label>W <input id="w" type="number" value="12"></label>
+  <label>H <input id="h" type="number" value="8"></label>
+  <label>Walls % <input id="walls" type="number" value="22" min="0" max="60"></label>
+  <label>Delay ms <input id="delay" type="number" value="250"></label>
+  <label>Pattern
+    <select id="pattern">
+      <option value="tree" selected>tree</option>
+      <option value="graph">graph</option>
+      <option value="linear">linear</option>
+    </select>
+  </label>
+  <button id="start">Start run</button>
+  <span id="status">connecting…</span>
+</header>
+<main>
+  <div class="panel">
+    <canvas id="grid" width="600" height="400"></canvas>
+    <div class="legend">
+      <span><span class="dot" style="background:#3ecf8e"></span> goal</span>
+      <span><span class="dot" style="background:#4da3ff"></span> true position (hidden from agent)</span>
+      <span><span class="dot" style="background:#ffb84d"></span> belief (agent's estimate)</span>
+      <span><span class="dot" style="background:#6a4c93;border-radius:2px"></span> planner explored (simulated only)</span>
+      <span><span class="dot" style="background:#3a2020;border-radius:2px"></span> wall</span>
+    </div>
+  </div>
+  <div class="panel">
+    <h3>Reward</h3>
+    <canvas id="reward" width="360" height="90"></canvas>
+    <h3 style="margin-top:14px">Event stream</h3>
+    <div id="log"></div>
+  </div>
+</main>
+<script>
+const gridCanvas = document.getElementById('grid');
+const gctx = gridCanvas.getContext('2d');
+const rewardCanvas = document.getElementById('reward');
+const rctx = rewardCanvas.getContext('2d');
+const logEl = document.getElementById('log');
+const statusEl = document.getElementById('status');
+
+let dims = { w: 12, h: 8 };
+let goal = null, truePos = null, belief = null;
+let trueTrail = [], beliefTrail = [];
+let rewards = [];
+let stepCount = 0;
+let walls = [], planTrail = [];
+let planning = false, planExpanded = 0, planBacktracks = 0;
+
+function cellSize() {
+  return Math.min(gridCanvas.width / dims.w, gridCanvas.height / dims.h);
+}
+
+function drawGrid() {
+  const cs = cellSize();
+  gctx.clearRect(0, 0, gridCanvas.width, gridCanvas.height);
+  gctx.strokeStyle = '#1d212a';
+  for (let x = 0; x <= dims.w; x++) {
+    gctx.beginPath(); gctx.moveTo(x*cs, 0); gctx.lineTo(x*cs, dims.h*cs); gctx.stroke();
+  }
+  for (let y = 0; y <= dims.h; y++) {
+    gctx.beginPath(); gctx.moveTo(0, y*cs); gctx.lineTo(dims.w*cs, y*cs); gctx.stroke();
+  }
+
+  gctx.fillStyle = '#3a2020';
+  walls.forEach(p => gctx.fillRect(p.X*cs+1, p.Y*cs+1, cs-2, cs-2));
+
+  gctx.fillStyle = '#6a4c93'; gctx.globalAlpha = 0.5;
+  planTrail.forEach(p => gctx.fillRect(p.X*cs + cs/2 - 2, p.Y*cs + cs/2 - 2, 4, 4));
+  gctx.globalAlpha = 1;
+
+  const trail = (pts, color) => {
+    gctx.strokeStyle = color; gctx.globalAlpha = 0.35; gctx.beginPath();
+    pts.forEach((p, i) => {
+      const cx = p.X*cs + cs/2, cy = p.Y*cs + cs/2;
+      i === 0 ? gctx.moveTo(cx, cy) : gctx.lineTo(cx, cy);
+    });
+    gctx.stroke(); gctx.globalAlpha = 1;
+  };
+  trail(trueTrail, '#4da3ff');
+  trail(beliefTrail, '#ffb84d');
+
+  const dot = (p, color, r) => {
+    if (!p) return;
+    gctx.fillStyle = color;
+    gctx.beginPath();
+    gctx.arc(p.X*cs + cs/2, p.Y*cs + cs/2, r, 0, 7);
+    gctx.fill();
+  };
+  if (goal) {
+    gctx.fillStyle = '#3ecf8e';
+    gctx.fillRect(goal.X*cs+3, goal.Y*cs+3, cs-6, cs-6);
+  }
+  dot(truePos, '#4da3ff', cs*0.22);
+  dot(belief, '#ffb84d', cs*0.14);
+}
+
+function drawReward() {
+  rctx.clearRect(0, 0, rewardCanvas.width, rewardCanvas.height);
+  if (rewards.length < 2) return;
+  const max = Math.max(...rewards, 1), min = Math.min(...rewards, -1);
+  const span = Math.max(max - min, 1);
+  rctx.strokeStyle = '#3ecf8e'; rctx.beginPath();
+  rewards.forEach((r, i) => {
+    const x = (i/(rewards.length-1)) * rewardCanvas.width;
+    const y = rewardCanvas.height - ((r - min)/span) * rewardCanvas.height;
+    i === 0 ? rctx.moveTo(x,y) : rctx.lineTo(x,y);
+  });
+  rctx.stroke();
+}
+
+function log(line, cls) {
+  const d = document.createElement('div');
+  d.innerHTML = line;
+  logEl.prepend(d);
+  while (logEl.children.length > 200) logEl.removeChild(logEl.lastChild);
+}
+
+function fmtPos(p) { return p ? `(${p.X},${p.Y})` : '?'; }
+
+function handleEvent(evt) {
+  if (evt.true) {
+    truePos = evt.true;
+    const last = trueTrail[trueTrail.length-1];
+    if (!last || last.X !== evt.true.X || last.Y !== evt.true.Y) trueTrail.push(evt.true);
+  }
+  if (evt.goal) goal = evt.goal;
+
+  switch (evt.type) {
+    case 'demo.run_reset':
+      dims = { w: evt.payload.width, h: evt.payload.height };
+      goal = evt.payload.goal;
+      truePos = evt.payload.start;
+      walls = evt.payload.walls || [];
+      belief = null;
+      trueTrail = [evt.payload.start];
+      beliefTrail = [];
+      planTrail = [];
+      planning = false; planExpanded = 0; planBacktracks = 0;
+      rewards = [];
+      stepCount = 0;
+      logEl.innerHTML = '';
+      statusEl.textContent = 'running…';
+      statusEl.className = '';
+      log(`<b>run reset</b> ${dims.w}x${dims.h} pattern <b>${evt.payload.pattern}</b> goal ${fmtPos(goal)} start ${fmtPos(truePos)} walls ${walls.length}`);
+      break;
+    case 'orchestrator.plan_started':
+      planning = true; planExpanded = 0; planBacktracks = 0; planTrail = [];
+      statusEl.textContent = 'planning…';
+      log(`<b>planning</b> route from ${fmtPos(evt.payload.Data)}`);
+      break;
+    case 'orchestrator.plan_expanded':
+      planExpanded++;
+      if (evt.payload.state && evt.payload.state.Data) planTrail.push(evt.payload.state.Data);
+      statusEl.textContent = `planning… ${planExpanded} explored, ${planBacktracks} backtracks`;
+      break;
+    case 'orchestrator.plan_backtrack':
+      planBacktracks++;
+      statusEl.textContent = `planning… ${planExpanded} explored, ${planBacktracks} backtracks`;
+      log(`<span style="color:#ffb84d">backtrack</span> from ${fmtPos(evt.payload.Data)}`);
+      break;
+    case 'orchestrator.plan_found':
+      planning = false;
+      statusEl.textContent = 'plan found — executing…';
+      log(`<b style="color:#3ecf8e">plan found</b>: ${evt.payload.length} steps (${planExpanded} explored, ${planBacktracks} backtracks)`);
+      break;
+    case 'orchestrator.step_started':
+      stepCount = evt.payload;
+      break;
+    case 'orchestrator.belief_updated':
+      belief = evt.payload.Data;
+      beliefTrail.push(belief);
+      log(`step ${stepCount}: belief → ${fmtPos(belief)}`);
+      break;
+    case 'orchestrator.action_selected':
+      log(`step ${stepCount}: action <b>${evt.payload.Name}</b>`);
+      break;
+    case 'orchestrator.reward':
+      rewards.push(evt.payload.Value);
+      log(`step ${stepCount}: reward ${evt.payload.Value} (dist ${evt.payload.Info})`);
+      drawReward();
+      break;
+    case 'orchestrator.goal_reached':
+      statusEl.textContent = `goal reached in ${stepCount+1} steps`;
+      statusEl.className = 'good';
+      log(`<b style="color:#3ecf8e">goal reached</b> at step ${stepCount}`);
+      break;
+    case 'orchestrator.step_error':
+      statusEl.textContent = 'error: ' + evt.payload;
+      statusEl.className = 'bad';
+      log(`<b style="color:#ff6b6b">error</b> ${evt.payload}`);
+      break;
+    case 'orchestrator.run_finished':
+      if (statusEl.className !== 'good') { statusEl.textContent = 'run finished'; }
+      break;
+  }
+  drawGrid();
+}
+
+const es = new EventSource('/events');
+es.onopen = () => { statusEl.textContent = 'connected — press Start run'; };
+es.onerror = () => { statusEl.textContent = 'disconnected'; statusEl.className = 'bad'; };
+es.onmessage = (m) => handleEvent(JSON.parse(m.data));
+
+document.getElementById('start').addEventListener('click', () => {
+  const body = {
+    width: parseInt(document.getElementById('w').value, 10),
+    height: parseInt(document.getElementById('h').value, 10),
+    delayMs: parseInt(document.getElementById('delay').value, 10),
+    pattern: document.getElementById('pattern').value,
+    wallDensity: parseInt(document.getElementById('walls').value, 10) / 100,
+  };
+  fetch('/start', { method: 'POST', body: JSON.stringify(body) });
+});
+
+drawGrid();
+</script>
+</body>
+</html>
